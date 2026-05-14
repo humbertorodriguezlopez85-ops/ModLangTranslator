@@ -6,6 +6,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.reflect.TypeToken;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.FileDialog;
@@ -19,7 +20,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintWriter;
+import java.io.Reader;
 import java.io.StringWriter;
+import java.io.Writer;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -81,6 +84,7 @@ public class ModLangTranslatorApp {
             "https://libretranslate.de/translate\n" +
             "https://translate.terraprint.co/translate\n" +
             "https://libretranslate.com/translate";
+    private static final boolean SKIP_ITEM_GROUP_TRANSLATION = true;
 
     private final JTextField jarPathField = new JTextField();
     private final JTextArea selectedModsArea = new JTextArea(5, 40);
@@ -422,55 +426,60 @@ public class ModLangTranslatorApp {
                 int skippedNoLang = 0;
                 int failed = 0;
 
-                for (int i = 0; i < total; i++) {
-                    if (cancelRequested.get() || isCancelled()) {
-                        return "CANCELLED::Translation cancelled by user. Progress: " + (i) + "/" + total;
-                    }
+                Translator translator = new Translator(endpoints, apiKeyField.getText().trim(), selectedApi, this::publish, () -> cancelRequested.get() || isCancelled());
 
-                    Path inputJar = finalJarsToProcess.get(i);
-                    Path outputJar = buildOutputJarPath(inputJar, targetLangCode);
-                    publish("[" + (i + 1) + "/" + total + "] Starting translation for: " + inputJar.getFileName());
+                try {
+                    for (int i = 0; i < total; i++) {
+                        if (cancelRequested.get() || isCancelled()) {
+                            return "CANCELLED::Translation cancelled by user. Progress: " + (i) + "/" + total;
+                        }
 
-                    Translator translator = new Translator(endpoints, apiKeyField.getText().trim(), selectedApi, this::publish, () -> cancelRequested.get() || isCancelled());
-                    try {
-                        int fileCount = translateJar(
-                                inputJar,
-                                outputJar,
-                                translator,
-                                sourceLangCode,
-                                targetLangCode,
-                                this::publish,
-                                () -> cancelRequested.get() || isCancelled()
-                        );
-                        translated++;
-                        publish("[" + (i + 1) + "/" + total + "] Completed. Generated: " + outputJar.getFileName() + " | translated lang files: " + fileCount);
+                        Path inputJar = finalJarsToProcess.get(i);
+                        Path outputJar = buildOutputJarPath(inputJar, targetLangCode);
+                        publish("[" + (i + 1) + "/" + total + "] Starting translation for: " + inputJar.getFileName());
 
                         try {
-                            Path disabled = inputJar.resolveSibling(inputJar.getFileName() + ".disable");
-                            Files.move(inputJar, disabled);
-                            publish("[" + (i + 1) + "/" + total + "] Original file renamed to: " + disabled.getFileName());
-                        } catch (Exception ex) {
-                            publish("[WARN] Could not rename original: " + ex.getMessage());
-                        }
-                    } catch (NoLangFilesException ex) {
-                        skippedNoLang++;
-                        publish("[" + (i + 1) + "/" + total + "] NO_LANG::" + ex.getMessage());
-                    } catch (ApiBlockedException ex) {
-                        publish("BLOCKED::" + ex.getMessage());
-                        return "BLOCKED::All endpoints blocked while processing " + inputJar.getFileName();
-                    } catch (InterruptedException ex) {
-                        if (cancelRequested.get() || isCancelled()) {
-                            return "CANCELLED::Translation cancelled by user. Progress: " + (i + 1) + "/" + total;
-                        }
-                        failed++;
-                        publish("[" + (i + 1) + "/" + total + "] Error: " + ex.getMessage());
-                    } catch (Exception ex) {
-                        failed++;
-                        publish("[" + (i + 1) + "/" + total + "] Error: " + ex.getMessage());
-                    }
-                }
+                            int fileCount = translateJar(
+                                    inputJar,
+                                    outputJar,
+                                    translator,
+                                    sourceLangCode,
+                                    targetLangCode,
+                                    this::publish,
+                                    () -> cancelRequested.get() || isCancelled()
+                            );
+                            translated++;
+                            publish("[" + (i + 1) + "/" + total + "] Completed. Generated: " + outputJar.getFileName() + " | translated lang files: " + fileCount);
 
-                return "DONE::Batch finished. Total=" + total + ", translated=" + translated + ", no_lang=" + skippedNoLang + ", failed=" + failed;
+                            try {
+                                Path disabled = inputJar.resolveSibling(inputJar.getFileName() + ".disable");
+                                Files.move(inputJar, disabled);
+                                publish("[" + (i + 1) + "/" + total + "] Original file renamed to: " + disabled.getFileName());
+                            } catch (Exception ex) {
+                                publish("[WARN] Could not rename original: " + ex.getMessage());
+                            }
+                        } catch (NoLangFilesException ex) {
+                            skippedNoLang++;
+                            publish("[" + (i + 1) + "/" + total + "] NO_LANG::" + ex.getMessage());
+                        } catch (ApiBlockedException ex) {
+                            publish("BLOCKED::" + ex.getMessage());
+                            return "BLOCKED::All endpoints blocked while processing " + inputJar.getFileName();
+                        } catch (InterruptedException ex) {
+                            if (cancelRequested.get() || isCancelled()) {
+                                return "CANCELLED::Translation cancelled by user. Progress: " + (i + 1) + "/" + total;
+                            }
+                            failed++;
+                            publish("[" + (i + 1) + "/" + total + "] Error: " + ex.getMessage());
+                        } catch (Exception ex) {
+                            failed++;
+                            publish("[" + (i + 1) + "/" + total + "] Error: " + ex.getMessage());
+                        }
+                    }
+
+                    return "DONE::Batch finished. Total=" + total + ", translated=" + translated + ", no_lang=" + skippedNoLang + ", failed=" + failed;
+                } finally {
+                    translator.saveCache();
+                }
             }
 
             @Override
@@ -684,6 +693,11 @@ public class ModLangTranslatorApp {
         int processed = 0;
         for (Map.Entry<String, JsonElement> e : root.entrySet()) {
             ensureNotCancelled(shouldCancel);
+            String key = e.getKey();
+            if (SKIP_ITEM_GROUP_TRANSLATION && key != null && key.toLowerCase(Locale.ROOT).startsWith("itemgroup.")) {
+                processed++;
+                continue;
+            }
             JsonElement value = e.getValue();
             if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()) {
                 String original = value.getAsString();
@@ -692,14 +706,14 @@ public class ModLangTranslatorApp {
                     continue;
                 }
 
-                ProtectResult protectedText = protectSegments(e.getKey(), original);
+                ProtectResult protectedText = protectSegments(key, original);
                 String candidate = protectedText.maskedText;
                 if (candidate.trim().isEmpty()) {
                     processed++;
                     continue;
                 }
 
-                pending.put(e.getKey(), protectedText);
+                pending.put(key, protectedText);
                 uniqueBatch.add(candidate);
                 processed++;
 
@@ -832,10 +846,7 @@ public class ModLangTranslatorApp {
         String normalized = text.trim();
         if (targetLangCode != null && targetLangCode.startsWith("es_")) {
             normalized = normalizeEnglishLeftoversForSpanish(normalized);
-            String canonical = canonicalTermFromKey(key, normalized);
-            if (canonical != null) {
-                normalized = enforceCanonicalLeadingNoun(normalized, canonical);
-            }
+            normalized = mejorarTraduccionMinecraft(key, normalized);
         }
 
         if ("es_mx".equalsIgnoreCase(targetLangCode)) {
@@ -889,6 +900,51 @@ public class ModLangTranslatorApp {
         return Pattern.compile("(?i)\\b" + Pattern.quote(sourceWord) + "\\b")
                 .matcher(text)
                 .replaceAll(Matcher.quoteReplacement(replacement));
+    }
+
+    private static String mejorarTraduccionMinecraft(String key, String translatedText) {
+        if (key == null || translatedText == null || translatedText.isBlank()) {
+            return translatedText;
+        }
+
+        String lowerKey = key.toLowerCase(Locale.ROOT);
+        String result = translatedText;
+
+        if (lowerKey.contains("item.") || lowerKey.contains(".equipment.")) {
+            if (lowerKey.contains("helmet")) {
+                result = "Casco de " + limpiarPrefijos(translatedText, "casco", "yelmo", "capacete");
+            } else if (lowerKey.contains("chestplate")) {
+                result = "Pechera de " + limpiarPrefijos(translatedText, "pechera", "peto", "coraza");
+            } else if (lowerKey.contains("leggings")) {
+                result = "Grebas de " + limpiarPrefijos(translatedText, "grebas", "pantalones", "leggings");
+            } else if (lowerKey.contains("boots")) {
+                result = "Botas de " + limpiarPrefijos(translatedText, "botas", "zapatos");
+            } else if (lowerKey.contains("sword")) {
+                result = "Espada de " + limpiarPrefijos(translatedText, "espada");
+            } else if (lowerKey.contains("pickaxe")) {
+                result = "Pico de " + limpiarPrefijos(translatedText, "pico");
+            } else if (lowerKey.contains("axe") && !lowerKey.contains("pickaxe")) {
+                result = "Hacha de " + limpiarPrefijos(translatedText, "hacha");
+            } else if (lowerKey.contains("shovel")) {
+                result = "Pala de " + limpiarPrefijos(translatedText, "pala");
+            } else if (lowerKey.contains("hoe")) {
+                result = "Azada de " + limpiarPrefijos(translatedText, "azada");
+            }
+        }
+
+        return result;
+    }
+
+    private static String limpiarPrefijos(String text, String... words) {
+        String cleaned = text;
+        for (String word : words) {
+            cleaned = cleaned.replaceAll("(?i)\\b" + Pattern.quote(word) + "\\b\\s*(de)?\\s*", "").trim();
+        }
+
+        if (!cleaned.isEmpty()) {
+            cleaned = Character.toUpperCase(cleaned.charAt(0)) + cleaned.substring(1);
+        }
+        return cleaned;
     }
 
     private static String canonicalTermFromKey(String key, String translatedText) {
@@ -1078,6 +1134,7 @@ public class ModLangTranslatorApp {
     private static class Translator {
         private static final int CHUNK_SIZE = 25;
         private static final int MAX_CONSECUTIVE_ERRORS = 10;
+        private static final Path CACHE_FILE = Path.of("translations_cache.json");
 
         private final Gson gson = new Gson();
         private final HttpClient client = HttpClient.newBuilder()
@@ -1098,6 +1155,37 @@ public class ModLangTranslatorApp {
             this.apiMode = apiMode;
             this.logger = logger;
             this.shouldCancel = shouldCancel;
+            loadCache();
+        }
+
+        private void loadCache() {
+            if (!Files.exists(CACHE_FILE)) {
+                return;
+            }
+
+            try (Reader reader = Files.newBufferedReader(CACHE_FILE, StandardCharsets.UTF_8)) {
+                Map<String, String> loaded = gson.fromJson(reader, new TypeToken<Map<String, String>>() {}.getType());
+                if (loaded != null && !loaded.isEmpty()) {
+                    cache.putAll(loaded);
+                    logger.accept("[CACHE] Loaded " + loaded.size() + " entries from disk.");
+                }
+            } catch (Exception e) {
+                logger.accept("[CACHE] Load error: " + e.getMessage());
+            }
+        }
+
+        private synchronized void saveCache() {
+            try (Writer writer = Files.newBufferedWriter(
+                    CACHE_FILE,
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE
+            )) {
+                gson.toJson(cache, writer);
+            } catch (Exception e) {
+                logger.accept("[CACHE] Save error: " + e.getMessage());
+            }
         }
 
         private String currentEndpoint() {
