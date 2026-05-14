@@ -25,16 +25,13 @@ buildNumber.properties
 *~
 .DS_Store
 
-# Build
+# Build output
 out/
 build/
 dist_new/
+dist/
 
 # Logs
 logs/
 *.log
 
-# Runtime (too large)
-dist/
-lib/
-runtime/
