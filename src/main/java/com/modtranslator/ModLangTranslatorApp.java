@@ -96,6 +96,7 @@ public class ModLangTranslatorApp {
     private final JComboBox<String> targetLangCombo = new JComboBox<>(LANG_CODES);
     private final JTextArea logArea = new JTextArea();
     private final JButton translateButton = new JButton("Translate and Build JAR");
+    private final JButton trainDictionaryButton = new JButton("Feed Dictionary (JARs)");
     private final JButton stopButton = new JButton("Stop");
     private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
     private volatile SwingWorker<String, String> currentWorker;
@@ -252,6 +253,7 @@ public class ModLangTranslatorApp {
         c.gridwidth = 2;
         JPanel actionPanel = new JPanel();
         actionPanel.add(translateButton);
+        actionPanel.add(trainDictionaryButton);
         actionPanel.add(stopButton);
         stopButton.setEnabled(false);
         top.add(actionPanel, c);
@@ -263,6 +265,7 @@ public class ModLangTranslatorApp {
         frame.add(logScroll, BorderLayout.CENTER);
 
         translateButton.addActionListener(e -> processJar(frame));
+        trainDictionaryButton.addActionListener(e -> processTrainingJars(frame));
         stopButton.addActionListener(e -> requestStop());
 
         log("File log path: " + fileLogPath.toAbsolutePath());
@@ -371,6 +374,11 @@ public class ModLangTranslatorApp {
     }
 
     private void processJar(JFrame parent) {
+        if (currentWorker != null && !currentWorker.isDone()) {
+            JOptionPane.showMessageDialog(parent, "Another task is already running.", "Busy", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
         List<Path> jarsToProcess = collectInputJars();
         if (jarsToProcess.isEmpty()) {
             JOptionPane.showMessageDialog(parent, "Select at least one valid .jar file", "Error", JOptionPane.ERROR_MESSAGE);
@@ -413,6 +421,7 @@ public class ModLangTranslatorApp {
         final int total = finalJarsToProcess.size();
 
         translateButton.setEnabled(false);
+        trainDictionaryButton.setEnabled(false);
         stopButton.setEnabled(true);
         cancelRequested.set(false);
         logArea.setText("");
@@ -492,6 +501,7 @@ public class ModLangTranslatorApp {
             @Override
             protected void done() {
                 translateButton.setEnabled(true);
+                trainDictionaryButton.setEnabled(true);
                 stopButton.setEnabled(false);
                 currentWorker = null;
                 try {
@@ -521,6 +531,217 @@ public class ModLangTranslatorApp {
 
         currentWorker = worker;
         worker.execute();
+    }
+
+    private void processTrainingJars(JFrame parent) {
+        if (currentWorker != null && !currentWorker.isDone()) {
+            JOptionPane.showMessageDialog(parent, "Another task is already running.", "Busy", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        String sourceLangCode = (String) sourceLangCombo.getSelectedItem();
+        String targetLangCode = (String) targetLangCombo.getSelectedItem();
+        if (sourceLangCode == null || targetLangCode == null) {
+            JOptionPane.showMessageDialog(parent, "Source/target languages are required", "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        if (sourceLangCode.equalsIgnoreCase(targetLangCode)) {
+            JOptionPane.showMessageDialog(parent, "Source and target language cannot be the same", "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        FileDialog dialog = new FileDialog(parent, "Select translated JAR(s) to train dictionary", FileDialog.LOAD);
+        dialog.setMultipleMode(true);
+        dialog.setFilenameFilter((dir, name) -> name != null && name.toLowerCase().endsWith(".jar"));
+        dialog.setVisible(true);
+
+        File[] files = dialog.getFiles();
+        if (files == null || files.length == 0) {
+            return;
+        }
+
+        List<Path> jars = new ArrayList<>();
+        for (File file : files) {
+            if (file != null && file.getName().toLowerCase().endsWith(".jar")) {
+                jars.add(file.toPath());
+            }
+        }
+        if (jars.isEmpty()) {
+            JOptionPane.showMessageDialog(parent, "Select at least one valid .jar file", "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        final List<Path> finalJars = List.copyOf(jars);
+        translateButton.setEnabled(false);
+        trainDictionaryButton.setEnabled(false);
+        stopButton.setEnabled(true);
+        cancelRequested.set(false);
+        log("Dictionary training started. Files: " + finalJars.size());
+
+        SwingWorker<String, String> worker = new SwingWorker<>() {
+            @Override
+            protected String doInBackground() {
+                Translator trainer = new Translator(
+                        List.of(MY_MEMORY_ENDPOINT),
+                        "",
+                        "MyMemory (Gratis)",
+                        this::publish,
+                        () -> cancelRequested.get() || isCancelled()
+                );
+
+                try {
+                        int learned = alimentarDiccionarioDesdeJars(
+                            finalJars,
+                            sourceLangCode,
+                            targetLangCode,
+                            trainer,
+                            this::publish,
+                            () -> cancelRequested.get() || isCancelled()
+                    );
+                    return "DONE::Dictionary training completed. Entries learned/corrected: " + learned;
+                } catch (InterruptedException e) {
+                    return "CANCELLED::Dictionary training cancelled by user.";
+                } finally {
+                    trainer.saveCache();
+                }
+            }
+
+            @Override
+            protected void process(List<String> chunks) {
+                for (String chunk : chunks) {
+                    log(chunk);
+                }
+            }
+
+            @Override
+            protected void done() {
+                translateButton.setEnabled(true);
+                trainDictionaryButton.setEnabled(true);
+                stopButton.setEnabled(false);
+                currentWorker = null;
+                try {
+                    String result = get();
+                    log(result);
+                    if (result.startsWith("CANCELLED::")) {
+                        JOptionPane.showMessageDialog(parent, result.substring("CANCELLED::".length()), "Cancelled", JOptionPane.WARNING_MESSAGE);
+                        return;
+                    }
+                    JOptionPane.showMessageDialog(parent, result.substring("DONE::".length()), "Dictionary Training", JOptionPane.INFORMATION_MESSAGE);
+                } catch (InterruptedException | ExecutionException e) {
+                    if (cancelRequested.get()) {
+                        log("Dictionary training cancelled by user.");
+                    } else {
+                        logException("Unexpected training completion error", e);
+                        log("Unexpected error: " + e.getMessage());
+                    }
+                }
+            }
+        };
+
+        currentWorker = worker;
+        worker.execute();
+    }
+
+    private int alimentarDiccionarioDesdeJars(
+            List<Path> jars,
+            String sourceLang,
+            String targetLang,
+            Translator translator,
+            java.util.function.Consumer<String> logger,
+            BooleanSupplier shouldCancel
+    ) throws InterruptedException {
+        int newEntries = 0;
+        int correctedEntries = 0;
+
+        for (Path jarPath : jars) {
+            ensureNotCancelled(shouldCancel);
+            logger.accept("[TRAIN] Reading " + jarPath.getFileName());
+
+            try (ZipFile zipFile = new ZipFile(jarPath.toFile())) {
+                Map<String, JsonObject> sourceFiles = new HashMap<>();
+                Map<String, JsonObject> targetFiles = new HashMap<>();
+
+                Enumeration<? extends ZipEntry> entries = zipFile.entries();
+                while (entries.hasMoreElements()) {
+                    ensureNotCancelled(shouldCancel);
+                    ZipEntry entry = entries.nextElement();
+                    if (entry.isDirectory()) {
+                        continue;
+                    }
+
+                    String entryName = entry.getName();
+                    if (!isSourceLangEntry(entryName, sourceLang) && !isSourceLangEntry(entryName, targetLang)) {
+                        continue;
+                    }
+
+                    try (InputStream in = zipFile.getInputStream(entry)) {
+                        JsonObject parsed = JsonParser.parseString(new String(in.readAllBytes(), StandardCharsets.UTF_8)).getAsJsonObject();
+                        if (isSourceLangEntry(entryName, sourceLang)) {
+                            sourceFiles.put(entryName, parsed);
+                        } else {
+                            targetFiles.put(entryName, parsed);
+                        }
+                    }
+                }
+
+                int jarLearned = 0;
+                int jarCorrected = 0;
+                for (Map.Entry<String, JsonObject> sourceFile : sourceFiles.entrySet()) {
+                    ensureNotCancelled(shouldCancel);
+                    String sourcePath = sourceFile.getKey();
+                    String targetPath = toTargetLangPath(sourcePath, sourceLang, targetLang);
+                    JsonObject targetJson = targetFiles.get(targetPath);
+                    if (targetJson == null) {
+                        continue;
+                    }
+
+                    JsonObject sourceJson = sourceFile.getValue();
+                    for (Map.Entry<String, JsonElement> sourceEntry : sourceJson.entrySet()) {
+                        String key = sourceEntry.getKey();
+                        JsonElement sourceValue = sourceEntry.getValue();
+                        JsonElement targetValue = targetJson.get(key);
+
+                        if (sourceValue == null || targetValue == null || !sourceValue.isJsonPrimitive() || !targetValue.isJsonPrimitive()) {
+                            continue;
+                        }
+
+                        if (!sourceValue.getAsJsonPrimitive().isString() || !targetValue.getAsJsonPrimitive().isString()) {
+                            continue;
+                        }
+
+                        String sourceText = sourceValue.getAsString();
+                        String targetText = targetValue.getAsString();
+                        if (sourceText == null || sourceText.isBlank() || targetText == null || targetText.isBlank()) {
+                            continue;
+                        }
+                        if (sourceText.equals(targetText) || looksLikeNonTranslatable(sourceText)) {
+                            continue;
+                        }
+
+                        String normalizedTarget = normalizeTranslatedValue(key, targetText, targetLang);
+                        if (sourceText.equals(normalizedTarget)) {
+                            continue;
+                        }
+
+                        int learnResult = translator.learnFromPair(sourceText, normalizedTarget, true);
+                        if (learnResult == Translator.LEARN_ADDED) {
+                            newEntries++;
+                            jarLearned++;
+                        } else if (learnResult == Translator.LEARN_UPDATED) {
+                            correctedEntries++;
+                            jarCorrected++;
+                        }
+                    }
+                }
+
+                logger.accept("[TRAIN] " + jarPath.getFileName() + " learned: " + jarLearned + ", corrected: " + jarCorrected);
+            } catch (Exception e) {
+                logger.accept("[TRAIN] Error processing " + jarPath.getFileName() + ": " + e.getMessage());
+            }
+        }
+
+        logger.accept("[TRAIN] Total learned: " + newEntries + ", corrected: " + correctedEntries);
+        return newEntries + correctedEntries;
     }
 
     private List<Path> collectInputJars() {
@@ -909,16 +1130,31 @@ public class ModLangTranslatorApp {
 
         String lowerKey = key.toLowerCase(Locale.ROOT);
         String result = translatedText;
+        boolean isLeather = isLeatherLike(lowerKey, translatedText);
 
         if (lowerKey.contains("item.") || lowerKey.contains(".equipment.")) {
-            if (lowerKey.contains("helmet")) {
-                result = "Casco de " + limpiarPrefijos(translatedText, "casco", "yelmo", "capacete");
-            } else if (lowerKey.contains("chestplate")) {
-                result = "Pechera de " + limpiarPrefijos(translatedText, "pechera", "peto", "coraza");
-            } else if (lowerKey.contains("leggings")) {
-                result = "Grebas de " + limpiarPrefijos(translatedText, "grebas", "pantalones", "leggings");
-            } else if (lowerKey.contains("boots")) {
-                result = "Botas de " + limpiarPrefijos(translatedText, "botas", "zapatos");
+            if (lowerKey.contains("helmet") || lowerKey.contains("hat") || lowerKey.contains("cap")) {
+                if (lowerKey.contains("turtle")) {
+                    result = "Caparazon de tortuga";
+                } else if (isLeather) {
+                    result = "Sombrero de " + limpiarPrefijos(translatedText, "sombrero", "casco", "yelmo", "capacete", "gorro", "gorra");
+                } else {
+                    result = "Casco de " + limpiarPrefijos(translatedText, "casco", "yelmo", "capacete", "sombrero");
+                }
+            } else if (lowerKey.contains("chestplate") || lowerKey.contains("tunic") || lowerKey.contains("robe")) {
+                if (isLeather) {
+                    result = "Tunica de " + limpiarPrefijos(translatedText, "tunica", "pechera", "peto", "coraza");
+                } else {
+                    result = "Peto de " + limpiarPrefijos(translatedText, "peto", "pechera", "coraza", "tunica");
+                }
+            } else if (lowerKey.contains("leggings") || lowerKey.contains("pants") || lowerKey.contains("trousers")) {
+                if (isLeather) {
+                    result = "Pantalones de " + limpiarPrefijos(translatedText, "pantalones", "grebas", "leggings", "pantalon");
+                } else {
+                    result = "Grebas de " + limpiarPrefijos(translatedText, "grebas", "pantalones", "leggings", "pantalon");
+                }
+            } else if (lowerKey.contains("boots") || lowerKey.contains("shoes")) {
+                result = "Botas de " + limpiarPrefijos(translatedText, "botas", "zapatos", "calzado");
             } else if (lowerKey.contains("sword")) {
                 result = "Espada de " + limpiarPrefijos(translatedText, "espada");
             } else if (lowerKey.contains("pickaxe")) {
@@ -927,9 +1163,20 @@ public class ModLangTranslatorApp {
                 result = "Hacha de " + limpiarPrefijos(translatedText, "hacha");
             } else if (lowerKey.contains("shovel")) {
                 result = "Pala de " + limpiarPrefijos(translatedText, "pala");
-            } else if (lowerKey.contains("hoe")) {
+            } else if (lowerKey.contains("hoe") || lowerKey.contains("mattock")) {
                 result = "Azada de " + limpiarPrefijos(translatedText, "azada");
+            } else if (lowerKey.contains("bow") && !lowerKey.contains("bowl")) {
+                result = "Arco " + limpiarPrefijos(translatedText, "arco");
+                if (result.trim().equals("Arco de")) {
+                    result = "Arco";
+                }
             }
+        }
+
+        if (result.endsWith(" de ")) {
+            result = result.substring(0, result.length() - 4);
+        } else if (result.endsWith(" de")) {
+            result = result.substring(0, result.length() - 3);
         }
 
         return result;
@@ -938,11 +1185,11 @@ public class ModLangTranslatorApp {
     private static String limpiarPrefijos(String text, String... words) {
         String cleaned = text;
         for (String word : words) {
-            cleaned = cleaned.replaceAll("(?i)\\b" + Pattern.quote(word) + "\\b\\s*(de)?\\s*", "").trim();
+            cleaned = cleaned.replaceAll("(?i)\\b" + Pattern.quote(word) + "\\b\\s*(del|de)?\\s*", "").trim();
         }
 
         if (!cleaned.isEmpty()) {
-            cleaned = Character.toUpperCase(cleaned.charAt(0)) + cleaned.substring(1);
+            cleaned = Character.toLowerCase(cleaned.charAt(0)) + cleaned.substring(1);
         }
         return cleaned;
     }
@@ -976,9 +1223,9 @@ public class ModLangTranslatorApp {
     }
 
     private static boolean isLeatherLike(String lowerKey, String translatedText) {
-        String lowerText = translatedText == null ? "" : translatedText.toLowerCase();
+        String lowerText = translatedText == null ? "" : translatedText.toLowerCase(Locale.ROOT);
         return lowerKey.contains("leather") || lowerKey.contains("cloth") || lowerKey.contains("robe") ||
-                lowerText.contains("cuero") || lowerText.contains("ropa") || lowerText.contains("tunica");
+            lowerText.contains("cuero") || lowerText.contains("ropa") || lowerText.contains("tunica") || lowerText.contains("túnica");
     }
 
     private static String enforceCanonicalLeadingNoun(String text, String noun) {
@@ -1132,6 +1379,10 @@ public class ModLangTranslatorApp {
     }
 
     private static class Translator {
+        private static final int LEARN_UNCHANGED = 0;
+        private static final int LEARN_ADDED = 1;
+        private static final int LEARN_UPDATED = 2;
+
         private static final int CHUNK_SIZE = 25;
         private static final int MAX_CONSECUTIVE_ERRORS = 10;
         private static final Path CACHE_FILE = Path.of("translations_cache.json");
@@ -1186,6 +1437,25 @@ public class ModLangTranslatorApp {
             } catch (Exception e) {
                 logger.accept("[CACHE] Save error: " + e.getMessage());
             }
+        }
+
+        private synchronized int learnFromPair(String sourceText, String targetText, boolean allowOverwrite) {
+            if (sourceText == null || sourceText.isBlank() || targetText == null || targetText.isBlank()) {
+                return LEARN_UNCHANGED;
+            }
+
+            String existing = cache.get(sourceText);
+            if (existing == null) {
+                cache.put(sourceText, targetText);
+                return LEARN_ADDED;
+            }
+
+            if (allowOverwrite && !existing.equals(targetText)) {
+                cache.put(sourceText, targetText);
+                return LEARN_UPDATED;
+            }
+
+            return LEARN_UNCHANGED;
         }
 
         private String currentEndpoint() {
